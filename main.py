@@ -20,6 +20,8 @@ from fpdf import FPDF
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
+import warnings
+warnings.filterwarnings("ignore")
 
 LM_STUDIO_CONFIG = {
     "base_url": "http://127.0.0.1:1234/v1",
