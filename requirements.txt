@@ -1,0 +1,5 @@
+PyPDF2
+requests
+spacy
+rich
+fpdf
