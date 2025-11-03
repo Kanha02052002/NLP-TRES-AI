@@ -135,6 +135,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+interview_sessions/
+data/
 
 # Spyder project settings
 .spyderproject
