@@ -137,6 +137,8 @@ env.bak/
 venv.bak/
 interview_sessions/
 data/
+models/
+train-data/
 
 # Spyder project settings
 .spyderproject

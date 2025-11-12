@@ -1,3 +1,4 @@
+# interview_system_with_res.py
 import PyPDF2
 import requests
 import uuid
@@ -20,8 +21,30 @@ from fpdf import FPDF
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
+import os
+from dotenv import load_dotenv
 import warnings
+# --- NEW: For RES Model ---
+import torch
+from transformers import DistilBertTokenizer, DistilBertModel
+import numpy as np
+# --- END NEW ---
+
 warnings.filterwarnings("ignore")
+load_dotenv()
+
+OPENROUTER_CONFIG = {
+    "api_key": os.getenv("OPENROUTER_API_KEY"),
+    "default_model": "minimax/minimax-m2:free",
+    "timeout": 60,
+    "headers": {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "TRES-AI Interview System"
+    },
+    "base_url": "https://openrouter.ai/api/v1/chat/completions"
+}
 
 LM_STUDIO_CONFIG = {
     "base_url": "http://127.0.0.1:1234/v1",
@@ -34,6 +57,7 @@ LM_STUDIO_CONFIG = {
 }
 
 DOMAINS = ["Data Science", "Frontend", "Backend", "DevOps"]
+
 INTERVIEW_FLOW = [
     {"name": "Greeting & Introduction", "description": "Warm up and test communication skills", "question_count": 1},
     {"name": "Resume-Driven Questions", "description": "Verify resume and ease candidate in", "question_count": 2},
@@ -43,6 +67,7 @@ INTERVIEW_FLOW = [
     {"name": "Candidate's Questions", "description": "Check curiosity and motivation", "question_count": 1},
     {"name": "Closing", "description": "End politely and leave a positive note", "question_count": 1}
 ]
+
 MAX_SKILLS_DISPLAY = 10
 MAX_PROJECTS_DISPLAY = 5
 EXPERIENCE_LEVELS = {
@@ -50,7 +75,6 @@ EXPERIENCE_LEVELS = {
 }
 
 console = Console()
-
 logging.basicConfig(filename='interview_terminal.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -61,6 +85,86 @@ except OSError:
     console.print("[bold red]Please install spaCy English model:[/bold red] python -m spacy download en_core_web_sm")
     logging.error("Failed to load spaCy model")
     sys.exit(1)
+
+# ==================== RES MODEL CONFIG & CLASSES ====================
+# --- NEW: RES Model Configuration ---
+RES_MODEL_PATH = "./models/res_scorer" # Path to your trained model directory
+RES_MODEL = None
+RES_TOKENIZER = None
+MAX_LENGTH = 128 # Match the length used during training
+
+class DistilBertForRegression(torch.nn.Module):
+    def __init__(self, model_name="distilbert-base-uncased"):
+        super().__init__()
+        self.distilbert = DistilBertModel.from_pretrained(model_name)
+        self.regressor = torch.nn.Sequential(
+            torch.nn.Dropout(0.2),
+            torch.nn.Linear(self.distilbert.config.dim, 1)
+        )
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
+        logits = self.regressor(outputs.last_hidden_state[:, 0]).squeeze(-1)
+        loss = None
+        if labels is not None:
+            loss = torch.nn.functional.mse_loss(logits, labels.float())
+        return {"loss": loss, "logits": logits}
+
+def load_res_model_and_tokenizer(logger=None):
+    """Load the trained RES model and tokenizer once."""
+    global RES_MODEL, RES_TOKENIZER
+    if RES_MODEL is not None and RES_TOKENIZER is not None:
+        return # Already loaded
+
+    try:
+        if logger:
+            logger.log_event("info", f"Loading RES model from {RES_MODEL_PATH}")
+        RES_TOKENIZER = DistilBertTokenizer.from_pretrained(RES_MODEL_PATH)
+        RES_MODEL = DistilBertForRegression() # Use the class defined above
+        RES_MODEL.load_state_dict(torch.load(f"{RES_MODEL_PATH}/pytorch_model.bin", map_location="cpu"))
+        RES_MODEL.eval() # Set to evaluation mode
+        if logger:
+            logger.log_event("success", "RES model and tokenizer loaded successfully")
+    except Exception as e:
+        if logger:
+            logger.log_event("error", f"Failed to load RES model/tokenizer: {e}")
+        RES_MODEL = None
+        RES_TOKENIZER = None
+
+def score_explainability_res(response_text, logger=None):
+    """Score the explainability of a response using the trained RES model."""
+    load_res_model_and_tokenizer(logger) # Ensure model is loaded
+    if RES_MODEL is None or RES_TOKENIZER is None:
+        if logger:
+            logger.log_event("warning", "RES model not available, returning default score 2.0")
+        return 2.0 # Default score if model fails to load
+
+    try:
+        # Preprocess input
+        inputs = RES_TOKENIZER(
+            response_text[:512], # Truncate very long responses
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=MAX_LENGTH # Use the same MAX_LENGTH as in training
+        )
+        with torch.no_grad(): # Turn off gradients for inference
+            outputs = RES_MODEL(**inputs)
+            score = outputs["logits"].item() # Get the predicted score
+
+        # Clamp the score to the expected range [1.0, 3.0] as defined in your training
+        clamped_score = float(np.clip(score, 1.0, 3.0))
+        if logger:
+            logger.log_event("info", f"RES score calculated: {score:.2f} (clamped to {clamped_score:.2f})")
+        return clamped_score
+
+    except Exception as e:
+        if logger:
+            logger.log_event("error", f"RES scoring failed: {e}")
+        # Return a default score or re-raise based on your preference
+        return 2.0
+# --- END NEW: RES Model Configuration ---
+
 
 # ==================== SESSION DIRECTORIES ====================
 def create_session_directories(session_id):
@@ -95,10 +199,41 @@ def call_lm_studio_model(prompt, max_tokens=500, temperature=0.7, stop=None):
             logging.info(f"LM Studio response received (first 100 chars): {result[:100]}...")
             return result
         else:
-            logging.error(f"LM Studio API error: {response.status_code}")
+            logging.error(f"LM Studio API error: {response.status_code} - {response.text}")
             return None
     except Exception as e:
         logging.error(f"LM Studio connection error: {str(e)}")
+        return None
+
+def call_openrouter_model(prompt, max_tokens=500, temperature=0.7, stop=None):
+    """Call OpenRouter model with standardized parameters"""
+    if not OPENROUTER_CONFIG["api_key"]:
+        logging.error("OpenRouter API key not found in environment variables (OPENROUTER_API_KEY)")
+        return None
+    try:
+        data = {
+            "model": OPENROUTER_CONFIG["default_model"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stop": stop
+        }
+        logging.info(f"Sending request to OpenRouter with prompt (first 100 chars): {prompt[:100]}...")
+        response = requests.post(
+            OPENROUTER_CONFIG["base_url"],
+            headers=OPENROUTER_CONFIG["headers"],
+            json=data,
+            timeout=OPENROUTER_CONFIG["timeout"]
+        )
+        if response.status_code == 200:
+            result = response.json()["choices"][0]["message"]["content"].strip()
+            logging.info(f"OpenRouter response received (first 100 chars): {result[:100]}...")
+            return result
+        else:
+            logging.error(f"OpenRouter API error: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        logging.error(f"OpenRouter connection error: {str(e)}")
         return None
 
 async def call_lm_studio_model_async(session, prompt, max_tokens=500, temperature=0.7, stop=None):
@@ -143,7 +278,7 @@ class MarkdownLogger:
             "responses": [],
             "evaluations": []
         }
-        with open(self.log_file, 'w', encoding='utf-8') as f: 
+        with open(self.log_file, 'w', encoding='utf-8') as f:
             f.write(f"# Interview Session Log - {session_id}\n")
             f.write(f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("---\n")
@@ -157,7 +292,7 @@ class MarkdownLogger:
             "data": data
         }
         self.session_data["events"].append(event)
-        with open(self.log_file, 'a', encoding='utf-8') as f: 
+        with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(f"## {event_type.upper()} - {datetime.now().strftime('%H:%M:%S')}\n")
             f.write(f"**Message:** {message}\n")
             if data is not None:
@@ -165,23 +300,29 @@ class MarkdownLogger:
             f.write("---\n")
         logging.info(f"[{event_type.upper()}] {message}")
 
-    def log_response(self, question, response, section, difficulty="N/A"):
+    # --- MODIFIED: Added res_score parameter ---
+    def log_response(self, question, response, section, difficulty="N/A", res_score=None):
         response_data = {
             "question": question,
             "response": response,
             "section": section,
             "difficulty": difficulty,
+            "res_score": res_score, # Add RES score to data dict
             "timestamp": datetime.now().isoformat()
         }
         self.session_data["responses"].append(response_data)
-        with open(self.log_file, 'a', encoding='utf-8') as f: 
+        with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(f"## RESPONSE - {datetime.now().strftime('%H:%M:%S')}\n")
             f.write(f"**Section:** {section}\n")
             f.write(f"**Difficulty:** {difficulty}\n")
+            # Add RES score to the log file if available
+            if res_score is not None:
+                f.write(f"**RES Score:** {res_score:.2f}\n")
             f.write(f"**Question:**\n{question}\n")
             f.write(f"**Response:**\n{response}\n")
             f.write("---\n")
         logging.info(f"Response logged for section {section}")
+    # --- END MODIFIED ---
 
     def log_evaluation(self, question, response, evaluation_data, section):
         eval_data = {
@@ -214,6 +355,7 @@ def extract_text_from_pdf(pdf_path, logger):
     except Exception as e:
         logger.log_event("error", f"Failed to extract text from PDF: {str(e)}")
         return ""
+
 # ==================== IMPROVED TRADITIONAL NER (spaCy + HF fallback) ====================
 def extract_entities_traditional(text, logger):
     """
@@ -221,23 +363,15 @@ def extract_entities_traditional(text, logger):
     Extracts: Name, Skills, Projects, Work Experience, Responsibilities, Education.
     """
     logger.log_event("info", "Starting traditional NER extraction (spaCy + HuggingFace fallback)")
-
     try:
         # ===== Preprocess =====
         doc = nlp(text)
         lines = [line.strip() for line in text.split('\n') if line.strip()]
-
-        # -----------------------------------------------------------------
-        #                      SMART NAME DETECTION
-        # -----------------------------------------------------------------
         name = None
         top_lines = [l for l in lines[:12] if len(l) > 1]
-
         edu_keywords = ['b.tech', 'm.tech', 'bsc', 'msc', 'phd', 'university', 'college', 'institute', 'degree']
         contact_keywords = ['phone', 'email', 'linkedin', 'github', 'portfolio', 'resume', 'cv']
         forbidden = edu_keywords + contact_keywords
-
-        # 1️⃣ Try spaCy PERSON entities from top lines
         person_entities = [ent.text.strip() for ent in doc.ents if ent.label_ == "PERSON"]
         if person_entities:
             for p in person_entities:
@@ -249,8 +383,6 @@ def extract_entities_traditional(text, logger):
                     break
             if not name:
                 name = max(person_entities, key=lambda s: len(s.split()))
-
-        # 2️⃣ Regex fallback: two or more capitalized words before contacts
         if not name:
             for line in top_lines:
                 if any(k in line.lower() for k in forbidden):
@@ -261,8 +393,7 @@ def extract_entities_traditional(text, logger):
                     if len(cand.split()) >= 2:
                         name = cand
                         break
-
-        # 3️⃣ HuggingFace NER fallback (dslim/bert-base-NER)
+        # dslim/bert-base-NER
         if not name or len(name.split()) < 2:
             try:
                 from transformers import pipeline
@@ -280,7 +411,6 @@ def extract_entities_traditional(text, logger):
             except Exception as e:
                 logger.log_event("warning", f"HuggingFace fallback unavailable: {e}")
 
-        # 4️⃣ Cleanup
         if name:
             name = re.sub(r'[\d.,;:]+$', '', name).strip()
             name = re.sub(r'^(hi|hello|hey)\b.*', '', name, flags=re.IGNORECASE).strip()
@@ -292,9 +422,6 @@ def extract_entities_traditional(text, logger):
         if not name:
             name = "Unknown"
 
-        # -----------------------------------------------------------------
-        #                      SECTION EXTRACTION
-        # -----------------------------------------------------------------
         sections = re.split(r'\n(?=[A-Z][A-Z ]{2,})', text)
         section_map = {}
         for sec in sections:
@@ -353,9 +480,6 @@ def extract_entities_traditional(text, logger):
                     if len(e.strip()) > 10:
                         education.append(e.strip())
 
-        # -----------------------------------------------------------------
-        #                      FINAL ENTITY STRUCTURE
-        # -----------------------------------------------------------------
         entities = {
             "name": name,
             "skills": list(skills)[:MAX_SKILLS_DISPLAY],
@@ -365,10 +489,8 @@ def extract_entities_traditional(text, logger):
             "education": education[:3],
             "total_experience_years": 0
         }
-
         logger.log_event("success", f"Traditional NER completed — Name Detected: {name}")
         return entities
-
     except Exception as e:
         logger.log_event("error", f"Traditional NER failed: {str(e)}")
         return {
@@ -381,72 +503,127 @@ def extract_entities_traditional(text, logger):
             "total_experience_years": 0
         }
 
-
-# ==================== LM STUDIO ENHANCED NER ====================
+# ==================== LM STUDIO ENHANCED NER (Few-Shot) ====================
 def extract_entities_with_lm_studio(text, logger):
-    """Extract structured resume entities using LM Studio (XML format)."""
-    logger.log_event("info", "Starting LM Studio NER extraction")
+    """Extract structured resume entities using LM Studio (XML format) with few-shot examples."""
+    logger.log_event("info", "Starting LM Studio NER extraction with few-shot prompting")
     try:
+        resume_text_limited = text[:2500]
         prompt = f"""<system>
-You are an expert resume parser. Extract structured information in XML format.
+You are an expert resume parser. Your task is to analyze the provided resume text and extract specific information.
+Respond ONLY with a well-formed XML block enclosed in <extraction> tags. Do not include any other text or explanations.
+The XML must contain the following elements:
+- <name>: The candidate's full name.
+- <skills>: List each skill in a separate <skill> tag.
+- <projects>: List each project in a separate <project> tag.
+- <work_experience>: List each work experience in a separate <experience> tag.
+- <responsibilities>: List each responsibility in a separate <responsibility> tag.
+- <education>: List each educational qualification in a separate <degree> tag.
+- <total_experience_years>: An integer representing the total years of experience.
 </system>
+<examples>
+<example>
+<resume>
+John Doe
+Software Engineer
+Skills: Python, Django, PostgreSQL, AWS
+Experience: Senior Software Engineer at TechCorp (2022-Present)
+Project: Built a data analytics dashboard using Python and Django.
+Education: B.Tech Computer Science, ABC University (2018-2022)
+</resume>
+<response>
+<extraction>
+<name>John Doe</name>
+<skills><skill>Python</skill><skill>Django</skill><skill>PostgreSQL</skill><skill>AWS</skill></skills>
+<projects><project>Built a data analytics dashboard using Python and Django.</project></projects>
+<work_experience><experience>Senior Software Engineer at TechCorp (2022-Present)</experience></work_experience>
+<responsibilities><responsibility>Developed backend services</responsibility><responsibility>Maintained databases</responsibility></responsibilities>
+<education><degree>B.Tech Computer Science, ABC University (2018-2022)</degree></education>
+<total_experience_years>3</total_experience_years>
+</extraction>
+</response>
+</example>
+<example>
+<resume>
+Jane Smith
+Data Scientist
+Skills: Python, R, SQL, Machine Learning, Pandas
+Experience: Data Analyst at DataCo (2020-2023)
+Project: Developed a predictive model for customer churn.
+Education: MSc Statistics, XYZ University (2018-2020)
+</resume>
+<response>
+<extraction>
+<name>Jane Smith</name>
+<skills><skill>Python</skill><skill>R</skill><skill>SQL</skill><skill>Machine Learning</skill><skill>Pandas</skill></skills>
+<projects><project>Developed a predictive model for customer churn.</project></projects>
+<work_experience><experience>Data Analyst at DataCo (2020-2023)</experience></work_experience>
+<responsibilities><responsibility>Performed data analysis</responsibility><responsibility>Created reports</responsibility></responsibilities>
+<education><degree>MSc Statistics, XYZ University (2018-2020)</degree></education>
+<total_experience_years>3</total_experience_years>
+</extraction>
+</response>
+</example>
+</examples>
 <task>
-Extract:
-1. Full Name
-2. Skills
-3. Projects
-4. Work Experience
-5. Responsibilities
-6. Education
-7. Total Experience Years (integer)
+Analyze the following resume text and extract the information according to the specified XML format.
 </task>
 <resume>
-{text[:2500]}
+{resume_text_limited}
 </resume>
-<response>"""
+<response>
+<extraction>"""
 
-        response_text = call_lm_studio_model(prompt, max_tokens=1500, temperature=0.3, stop=["</response>"])
+        # Call LM Studio with the prompt
+        response_text = call_lm_studio_model(prompt, max_tokens=1500, temperature=0.3, stop=["</extraction>"])
         if not response_text:
+            logger.log_event("warning", "LM Studio NER returned no response")
             return None
 
-        import xml.etree.ElementTree as ET
-        xml_response = "<response>" + response_text.strip() + "</response>"
-        root = ET.fromstring(xml_response)
-        extraction = root.find('extraction')
-        if extraction is None:
+        logger.log_event("info", f"LM Studio NER raw response (first 200 chars): {response_text[:200]}...")
+        try:
+            import xml.etree.ElementTree as ET
+            # Ensure the response is properly closed by appending the closing tag
+            full_xml_string = f"<extraction>{response_text.strip()}</extraction>"
+            logger.log_event("info", f"Parsing XML string: {full_xml_string[:300]}...") # Log for debugging
+            root = ET.fromstring(full_xml_string)
+
+            # Extract elements, handling potentially missing ones gracefully
+            name = root.findtext('name', '').strip() or None
+            skills = [s.text.strip() for s in root.findall('.//skill') if s.text and s.text.strip()]
+            projects = [p.text.strip() for p in root.findall('.//project') if p.text and p.text.strip()]
+            work_experience = [exp.text.strip() for exp in root.findall('.//experience') if exp.text and exp.text.strip()]
+            responsibilities = [r.text.strip() for r in root.findall('.//responsibility') if r.text and r.text.strip()]
+            education = [e.text.strip() for e in root.findall('.//degree') if e.text and e.text.strip()]
+
+            # Attempt to parse experience years, defaulting to 0 if not found or invalid
+            try:
+                total_experience_years = int(root.findtext('total_experience_years', 0))
+            except ValueError:
+                logger.log_event("warning", "Failed to parse 'total_experience_years' as integer, defaulting to 0")
+                total_experience_years = 0
+
+            # Construct the final entity dictionary
+            extraction = {
+                "name": name,
+                "skills": skills,
+                "projects": projects,
+                "work_experience": work_experience,
+                "responsibilities": responsibilities,
+                "education": education,
+                "total_experience_years": total_experience_years
+            }
+            logger.log_event("success", "LM Studio NER extraction completed successfully")
+            return extraction
+        except ET.ParseError as e:
+            logger.log_event("error", f"Failed to parse XML from LM Studio NER: {e}. Raw response: {response_text}")
+            return None # Return None on parse failure
+        except Exception as e:
+            logger.log_event("error", f"Unexpected error during LM Studio NER processing: {e}")
             return None
-
-        entities = {
-            "name": extraction.findtext('name', ''),
-            "skills": [s.text.strip() for s in extraction.findall('.//skill') if s.text],
-            "projects": [],
-            "work_experience": [],
-            "responsibilities": [r.text.strip() for r in extraction.findall('.//responsibility') if r.text],
-            "education": [e.text.strip() for e in extraction.findall('.//degree') if e.text],
-            "total_experience_years": int(extraction.findtext('total_experience_years', 0))
-        }
-
-        for proj in extraction.findall('.//project'):
-            title = proj.findtext('title', '').strip()
-            desc = proj.findtext('description', '').strip()
-            if title:
-                entities["projects"].append(f"{title}: {desc}" if desc else title)
-
-        for exp in extraction.findall('.//experience'):
-            role = exp.findtext('role', '').strip()
-            company = exp.findtext('company', '').strip()
-            duration = exp.findtext('duration', '').strip()
-            entry = f"{role} at {company} ({duration})".strip()
-            if entry:
-                entities["work_experience"].append(entry)
-
-        logger.log_event("success", "LM Studio NER extraction completed successfully")
-        return entities
-
     except Exception as e:
-        logger.log_event("error", f"LM Studio NER extraction failed: {str(e)}")
-        return None
-
+        logger.log_event("error", f"LM Studio NER extraction failed with exception: {str(e)}")
+        return None # Return None on general failure
 
 # ==================== HYBRID NER (COMBINED) ====================
 def extract_entities_hybrid(text, logger):
@@ -478,8 +655,6 @@ def extract_entities_hybrid(text, logger):
     logger.log_event("info", f"LM Studio unavailable — using traditional NER (Name: {traditional['name']})")
     return traditional
 
-
-
 # ==================== EXPERIENCE LEVEL DETERMINATION ====================
 def determine_experience_level(years_experience, logger):
     """Determine experience level based on years"""
@@ -491,62 +666,131 @@ def determine_experience_level(years_experience, logger):
     logger.log_event("warning", "Defaulting to ENTRY_LEVEL experience")
     return "ENTRY_LEVEL"
 
-# ==================== DOMAIN CLASSIFIER ====================
+# ==================== DOMAIN CLASSIFIER (Few-Shot) ====================
 def classify_domain_with_lm_studio(resume_text, logger):
-    """Classify resume domain using LM Studio"""
-    logger.log_event("info", "Starting domain classification")
+    """Classify resume domain using LM Studio with few-shot examples. Falls back to OpenRouter if LM Studio fails."""
+    logger.log_event("info", "Starting domain classification with LM Studio (falls back to OpenRouter)")
     try:
+        domains_str = ', '.join(DOMAINS)
+        resume_text_limited = resume_text[:1000]
         prompt = f"""<system>
-Classify the resume into one of these domains: {', '.join(DOMAINS)}.
-Provide your response in XML format.
+You are an expert technical recruiter. Your task is to classify a resume into one of the following predefined technical domains: {domains_str}.
+Your response must be ONLY a well-formed XML block containing a single <classification> tag with a nested <domain> tag. The text inside <domain> must be exactly one of the specified domains. Do not provide any other text, explanations, or reasoning.
 </system>
 <examples>
 <example>
-<resume>Experience with Python, machine learning, data analysis, pandas, scikit-learn</resume>
+<resume>Experience with Python, machine learning, data analysis, pandas, scikit-learn, SQL, Tableau. Project: Built a customer churn prediction model.</resume>
 <response><classification><domain>Data Science</domain></classification></response>
 </example>
 <example>
-<resume>React, Vue.js, HTML, CSS, JavaScript frameworks</resume>
+<resume>Skills: React, Vue.js, HTML, CSS, JavaScript, Redux. Experience: Frontend Developer at WebSolutions Inc.</resume>
 <response><classification><domain>Frontend</domain></classification></response>
 </example>
 <example>
-<resume>Node.js, Python backend, REST APIs, databases</resume>
+<resume>Skills: Node.js, Python Flask, REST APIs, PostgreSQL, Docker. Experience: Backend Developer at TechCorp.</resume>
 <response><classification><domain>Backend</domain></classification></response>
 </example>
 <example>
-<resume>Docker, Kubernetes, AWS, CI/CD pipelines</resume>
+<resume>Skills: AWS, Docker, Kubernetes, Jenkins, CI/CD pipelines. Experience: DevOps Engineer at CloudTech.</resume>
 <response><classification><domain>DevOps</domain></classification></response>
 </example>
 </examples>
 <task>
-Classify the following resume:
+Classify the following resume into one of the specified domains based on the skills, projects, and experience described. Respond ONLY with the XML classification.
 </task>
 <resume>
-{resume_text[:1000]}
+{resume_text_limited}
 </resume>
 <response>"""
+
+        logger.log_event("info", "Attempting domain classification with LM Studio...")
         response_text = call_lm_studio_model(prompt, max_tokens=100, temperature=0.1, stop=["</response>"])
         if response_text:
-            import xml.etree.ElementTree as ET
+            logger.log_event("info", f"LM Studio returned a response, attempting to parse...")
+            # Attempt to parse the XML response from LM Studio
             try:
-                xml_response = "<response>" + response_text.strip() + "</response>"
-                root = ET.fromstring(xml_response)
+                import xml.etree.ElementTree as ET
+                # Wrap the response in a root tag for parsing if needed
+                full_xml_string = f"<root>{response_text.strip()}</root>"
+                logger.log_event("info", f"Parsing XML string for domain from LM Studio: {full_xml_string}")
+                root = ET.fromstring(full_xml_string)
+                # Find the classification tag
                 classification = root.find('classification')
                 if classification is not None:
+                    # Find the domain tag inside classification
                     domain_elem = classification.find('domain')
                     if domain_elem is not None and domain_elem.text:
-                        domain = domain_elem.text.strip()
-                        for d in DOMAINS:
-                            if d.lower() == domain.lower():
-                                logger.log_event("success", f"Domain classified as: {d}")
-                                return d
-            except ET.ParseError:
-                pass
-        logger.log_event("warning", f"Fallback to default domain: {DOMAINS[0]}")
-        return DOMAINS[0]
+                        # Get the domain text and clean it
+                        domain_from_lm = domain_elem.text.strip()
+                        logger.log_event("info", f"Raw domain extracted from LM Studio: '{domain_from_lm}'")
+                        # Verify the domain is one of the expected ones (case-insensitive)
+                        for domain_option in DOMAINS:
+                            if domain_option.lower() == domain_from_lm.lower():
+                                logger.log_event("success", f"Domain classified successfully by LM Studio as: {domain_option}")
+                                return domain_option # Return the correctly capitalized domain name
+            except ET.ParseError as e:
+                logger.log_event("error", f"Failed to parse XML from LM Studio domain classification: {e}. Raw response: {response_text}")
+            except Exception as e:
+                logger.log_event("error", f"Unexpected error during LM Studio domain classification parsing: {e}")
+
+            # If LM Studio returned a response but parsing/validation failed
+            logger.log_event("warning", f"LM Studio response was received but parsing/validation failed. Falling back to OpenRouter.")
+
+        else:
+            # LM Studio returned no response
+            logger.log_event("warning", "LM Studio domain classification returned no response. Falling back to OpenRouter.")
+
+        logger.log_event("info", "Attempting domain classification with OpenRouter...")
+        openrouter_response_text = call_openrouter_model(prompt, max_tokens=100, temperature=0.1, stop=["</response>"])
+        if not openrouter_response_text:
+            logger.log_event("error", "OpenRouter domain classification also returned no response.")
+            # Fallback to a random domain if both fail
+            import random
+            fallback_domain = random.choice(DOMAINS)
+            logger.log_event("warning", f"Both LM Studio and OpenRouter failed. Defaulting to random fallback domain: {fallback_domain}")
+            return fallback_domain
+
+        logger.log_event("info", f"OpenRouter returned a response, attempting to parse...")
+        # Attempt to parse the XML response from OpenRouter
+        try:
+            import xml.etree.ElementTree as ET
+            # Wrap the response in a root tag for parsing if needed
+            full_xml_string_or = f"<root>{openrouter_response_text.strip()}</root>"
+            logger.log_event("info", f"Parsing XML string for domain from OpenRouter: {full_xml_string_or}")
+            root_or = ET.fromstring(full_xml_string_or)
+            # Find the classification tag
+            classification_or = root_or.find('classification')
+            if classification_or is not None:
+                # Find the domain tag inside classification
+                domain_elem_or = classification_or.find('domain')
+                if domain_elem_or is not None and domain_elem_or.text:
+                    # Get the domain text and clean it
+                    domain_from_or = domain_elem_or.text.strip()
+                    logger.log_event("info", f"Raw domain extracted from OpenRouter: '{domain_from_or}'")
+                    # Verify the domain is one of the expected ones (case-insensitive)
+                    for domain_option in DOMAINS:
+                        if domain_option.lower() == domain_from_or.lower():
+                            logger.log_event("success", f"Domain classified successfully by OpenRouter as: {domain_option}")
+                            return domain_option # Return the correctly capitalized domain name
+        except ET.ParseError as e:
+            logger.log_event("error", f"Failed to parse XML from OpenRouter domain classification: {e}. Raw response: {openrouter_response_text}")
+        except Exception as e:
+            logger.log_event("error", f"Unexpected error during OpenRouter domain classification parsing: {e}")
+
+        # If OpenRouter returned a response but parsing/validation failed
+        logger.log_event("error", f"OpenRouter response was received but parsing/validation failed.")
+        import random
+        fallback_domain = random.choice(DOMAINS)
+        logger.log_event("warning", f"Parsing failed for OpenRouter. Defaulting to random fallback domain: {fallback_domain}")
+        return fallback_domain
+
     except Exception as e:
-        logger.log_event("error", f"Domain classification failed: {str(e)}")
-        return DOMAINS[0]
+        logger.log_event("error", f"Domain classification failed with exception: {str(e)}")
+        # Fallback in case of general failure
+        import random
+        fallback_domain = random.choice(DOMAINS)
+        logger.log_event("warning", f"Exception fallback to random domain: {fallback_domain}")
+        return fallback_domain
 
 # ==================== PROFILE CREATOR ====================
 def create_profile(entities, domain, logger):
@@ -598,7 +842,7 @@ class SessionManager:
         }
         self.logger.log_event("success", f"Session created: {session_id}")
         return session_id
-    
+
     def set_pre_generated_questions(self, session_id, questions):
         """Store pre-generated questions for the session"""
         if self.is_valid(session_id):
@@ -606,28 +850,25 @@ class SessionManager:
             self.logger.log_event("success", f"Pre-generated questions stored for session {session_id}")
             return True
         return False
-    
+
     def get_next_question(self, session_id):
         """Get the next pre-generated question"""
         if not self.is_valid(session_id):
             return None
-        
         questions = self.sessions[session_id].get("pre_generated_questions")
         if not questions:
             return None
-        
         # Flatten all questions from all sections into a single list
         flat_questions = []
         for section_data in questions:
             for q in section_data["questions"]:
                 flat_questions.append(q)
-        
+
         current_index = self.sessions[session_id].get("current_question_index", 0)
         if current_index < len(flat_questions):
             question_data = flat_questions[current_index]
             self.sessions[session_id]["current_question_index"] = current_index + 1
             return question_data
-        
         return None
 
     def is_valid(self, session_id):
@@ -646,12 +887,10 @@ class SessionManager:
             })
             progress = self.sessions[session_id]["interview_progress"]
             progress["questions_asked"] += 1
-            
             progress["asked_questions"].add(question)
             progress["asked_questions_list"].append(question)
             if len(progress["asked_questions_list"]) > 10:
                 progress["asked_questions_list"] = progress["asked_questions_list"][-10:]
-            
             self.logger.log_event("info", f"Response added for session {session_id}")
             return True
         return False
@@ -680,18 +919,17 @@ def generate_dynamic_question(section_info, domain, experience_level, profile, s
     session_data = session_manager.get_session_data(session_id)
     progress = session_data["interview_progress"]
     section_name = section_info["name"]
-    
     recent_responses = session_data.get("responses", [])[-3:]
     conversation_context = "\n".join([f"Q: {r['question']}\nA: {r['response']}" for r in recent_responses])
-    
+
     if "asked_resume_items" not in session_data:
         session_data["asked_resume_items"] = {"projects": set(), "skills": set()}
     asked_items = session_data["asked_resume_items"]
     asked_projects = asked_items.get("projects", set())
     asked_skills = asked_items.get("skills", set())
-    
+
     current_q_index = progress.get("current_question_in_section", 0)
-    
+
     if follow_up:
         question_type = "follow_up"
         context_prompt = f"""You need to ask a follow-up question to clarify or probe deeper into the candidate's previous response. The previous question and response were:
@@ -703,18 +941,13 @@ Ask a specific follow-up question that helps clarify or expand on their answer. 
         context_prompt = f"Start the interview with a warm greeting. Ask them to introduce themselves and tell you about their background in {domain}."
     elif section_name == "Resume-Driven Questions":
         question_type = "resume_descriptive" if current_q_index == 0 else "resume_analytical"
-        
         if current_q_index == 0:
             projects = profile.get('projects', [])
             skills = profile.get('skills', [])
-            
             unasked_projects = [p for p in projects if p not in asked_projects]
-            
             unasked_skills = [s for s in skills if s not in asked_skills]
-            
             focus_item = None
             focus_type = None
-            
             if unasked_projects:
                 focus_item = unasked_projects[0]
                 focus_type = "project"
@@ -733,11 +966,10 @@ Ask a specific follow-up question that helps clarify or expand on their answer. 
                 context_prompt = f"Ask about their technical skills in general, or a different aspect of their skill set. Don't repeat previous questions."
             else:
                 context_prompt = "Ask about their resume and experience. Be specific and don't repeat previous questions."
-            
             if focus_item and focus_type:
                 asked_items[f"{focus_type}s"].add(focus_item)
         else:
-            recent_responses_in_section = [r for r in session_data.get("responses", []) 
+            recent_responses_in_section = [r for r in session_data.get("responses", [])
                                         if r.get("section") == "Resume-Driven Questions"][-1:]
             if recent_responses_in_section:
                 context_prompt = "Based on their previous response about their resume, ask a deeper analytical question about a DIFFERENT aspect - challenges, decisions, outcomes, or lessons learned. Don't ask the same type of question."
@@ -763,8 +995,7 @@ Ask a specific follow-up question that helps clarify or expand on their answer. 
     else:
         question_type = "general"
         context_prompt = "Ask a relevant interview question for this section."
-    
-    
+
     if section_name == "Resume-Driven Questions":
         already_asked_block = (
             f"<already_asked_resume_items>\n"
@@ -785,7 +1016,6 @@ Ask a specific follow-up question that helps clarify or expand on their answer. 
     4. Show genuine interest in their responses
     5. Respond ONLY with the question text - no extra commentary
     </system>
-
     <candidate_info>
     Name: {profile.get('name', 'Candidate')}
     Domain: {domain}
@@ -793,36 +1023,29 @@ Ask a specific follow-up question that helps clarify or expand on their answer. 
     Years of Experience: {profile.get('total_experience_years', 'N/A')}
     Key Skills: {', '.join(profile.get('skills', [])[:5])}
     </candidate_info>
-
     <current_section>
     Section: {section_name}
     Description: {section_info.get('description', '')}
     Question Type: {question_type}
     </current_section>
-
     <conversation_history>
     {conversation_context if conversation_context else "This is the beginning of the interview."}
     </conversation_history>
-
     {already_asked_block}
-
     <task>
     {context_prompt}
-
     Generate a single, natural interview question. Make it specific to the candidate's background when possible.
     {"IMPORTANT: Do NOT ask about projects or skills that have already been asked about (listed above). Ask about different items instead." if section_name == "Resume-Driven Questions" and (asked_projects or asked_skills) else ""}
     </task>
-
     <question>
     """
 
-    
     response_text = call_lm_studio_model(prompt, max_tokens=200, temperature=0.7, stop=["</question>"])
     if response_text and len(response_text.strip()) > 10:
         question = response_text.strip()
         logger.log_event("success", f"Dynamic question generated for {section_name}: {question[:50]}...")
         return question
-    
+
     # Fallback
     fallbacks = {
         "introduction": f"Hi {profile.get('name', 'there')}, thanks for joining us today! To start, could you tell me a bit about yourself and what draws you to {domain}?",
@@ -853,8 +1076,7 @@ Respond with:
 - CONTINUE if the answer is satisfactory and complete
 </evaluation>
 <decision>"""
-    
-    result = call_lm_studio_model(prompt, max_tokens=10, temperature=0.3, stop=["\n"])
+    result = call_lm_studio_model(prompt, max_tokens=10, temperature=0.3, stop="\n")
     if result and "FOLLOWUP" in result.upper():
         logger.log_event("info", "Response needs follow-up")
         return True
@@ -874,7 +1096,6 @@ Generate a single, specific follow-up question that helps clarify or expand on t
 Be natural and conversational - this should feel like a real conversation.
 </task>
 <follow_up_question>"""
-    
     response_text = call_lm_studio_model(prompt, max_tokens=150, temperature=0.7, stop=["</follow_up_question>"])
     if response_text and len(response_text.strip()) > 10:
         return response_text.strip()
@@ -886,12 +1107,10 @@ def generate_all_questions(domain, experience_level, profile, logger):
     logger.log_event("info", "Pre-generating all interview questions")
     all_questions = []
     previously_generated = []  # Track all previously generated questions to avoid repetition
-    
     for section_index, section_info in enumerate(INTERVIEW_FLOW):
         section_name = section_info["name"]
         num_questions = section_info["question_count"]
         section_questions = []
-        
         # Determine question types for this section
         question_types_map = {
             "Greeting & Introduction": "introduction",
@@ -902,7 +1121,6 @@ def generate_all_questions(domain, experience_level, profile, logger):
             "Candidate's Questions": "candidate_questions",
             "Closing": "closing"
         }
-        
         for q_in_section in range(num_questions):
             # Determine question type
             if section_name == "Resume-Driven Questions":
@@ -923,12 +1141,12 @@ def generate_all_questions(domain, experience_level, profile, logger):
                 question_type = "closing"
             else:  # Greeting & Introduction
                 question_type = "introduction"
-            
+
             logger.log_event("info", f"Generating question {q_in_section + 1}/{num_questions} for section: {section_name} (Type: {question_type})")
-            
+
             # Build prompt with all previously generated questions to avoid repetition
             previously_generated_text = "\n".join([f"{i+1}. {q['question']}" for i, q in enumerate(previously_generated)]) if previously_generated else "None yet"
-            
+
             prompt = f"""<system>
 You are LoRa, a professional and experienced technical interviewer for {domain} roles. Your goal is to conduct a realistic, engaging, and insightful interview.
 Key Principles:
@@ -1015,7 +1233,7 @@ Generate a SINGLE, UNIQUE interview question that:
 5. If asking about resume items, choose DIFFERENT projects/skills than previously asked
 </task>
 <question>"""
-            
+
             response_text = call_lm_studio_model(prompt, max_tokens=250, temperature=0.8, stop=["</question>"])
             if response_text and len(response_text.strip()) > 10:
                 question = response_text.strip()
@@ -1054,12 +1272,12 @@ Generate a SINGLE, UNIQUE interview question that:
                 }
                 section_questions.append(question_data)
                 previously_generated.append(question_data)
-        
+
         all_questions.append({
             "section": section_info,
             "questions": section_questions
         })
-    
+
     logger.log_event("success", f"Successfully pre-generated {sum(len(s['questions']) for s in all_questions)} questions")
     return all_questions
 
@@ -1101,9 +1319,10 @@ def generate_question_master_prompt(domain, section_info, experience_level, sess
     technical_difficulty = progress.get("technical_difficulty", "EASY")
     previous_context = progress.get("previous_context")
     profile = session_data.get("profile", {})
+
     # Use the list of recently asked questions
     asked_questions_list = progress.get("asked_questions_list", [])
-    
+
     logger.log_event("info", f"Generating {question_type} question for {section_name} (Difficulty: {technical_difficulty})")
 
     # Master Prompt
@@ -1229,7 +1448,7 @@ Evaluate the candidate's response for difficulty adjustment.
 <question>{question}</question>
 <answer>{response}</answer>
 <evaluation>"""
-        response_text = call_lm_studio_model(prompt, max_tokens=20, temperature=0.3, stop=["\n"])
+        response_text = call_lm_studio_model(prompt, max_tokens=20, temperature=0.3, stop="\n")
         if response_text:
             indicator = response_text.strip().upper()
             if indicator in ["CORRECT", "PARTIAL", "INCORRECT"]:
@@ -1263,25 +1482,24 @@ async def generate_analysis_section_async(session, section_name, prompt_template
 def generate_post_interview_analysis(session_data, profile, logger):
     """Generate a detailed post-interview analysis using LM Studio with async parallelization."""
     logger.log_event("info", "Generating post-interview analysis with LM Studio (async parallel)")
-    
     try:
         responses = session_data.get("responses", [])
         if not responses:
             logger.log_event("warning", "No responses found in session data")
-            return "# Post-Interview Analysis\n\nNo interview responses available for analysis."
-        
+            return "# Post-Interview Analysis\nNo interview responses available for analysis."
+
         # Prepare context data
-        responses_text = "\n".join([f"Q{i+1}: {r['question']}\nA: {r['response']}\nSection: {r['section']}\n---" 
+        responses_text = "\n".join([f"Q{i+1}: {r['question']}\nA: {r['response']}\nSection: {r['section']}\n---"
                                     for i, r in enumerate(responses)])
-        
+
         # Separate responses by section type for better analysis
         technical_responses = [r for r in responses if r.get('section') in ['Technical Deep-Dive', 'Applied Problem-Solving']]
         behavioral_responses = [r for r in responses if r.get('section') in ['Behavioral & Soft Skills', 'Greeting & Introduction']]
         resume_responses = [r for r in responses if r.get('section') == 'Resume-Driven Questions']
-        
+
         technical_text = "\n".join([f"Q: {r['question']}\nA: {r['response']}\n---" for r in technical_responses]) if technical_responses else "No technical responses"
         behavioral_text = "\n".join([f"Q: {r['question']}\nA: {r['response']}\n---" for r in behavioral_responses]) if behavioral_responses else "No behavioral responses"
-        
+
         context_base = {
             'candidate_name': profile.get('name', 'Unknown'),
             'domain': session_data.get('domain', 'N/A'),
@@ -1294,11 +1512,11 @@ def generate_post_interview_analysis(session_data, profile, logger):
             'behavioral_responses': behavioral_text,
             'resume_responses': "\n".join([f"Q: {r['question']}\nA: {r['response']}\n---" for r in resume_responses]) if resume_responses else "No resume responses"
         }
-        
+
         # Define prompts for each section (to be generated in parallel)
         section_prompts = {
             'overall': """<system>
-You are a senior hiring manager providing an overall assessment of a candidate.
+You are an experienced hiring technical mananger providing an overall assessment of a candidate.
 Be concise, professional, and fair. Provide a clear overall impression.
 </system>
 <task>
@@ -1317,7 +1535,6 @@ Years of Experience: {years_experience}
 Write a concise overall impression (2-3 paragraphs) of the candidate's interview performance. Be specific and reference their responses.
 </task>
 <overall_impression>""",
-            
             'strengths': """<system>
 You are a senior hiring manager analyzing candidate strengths.
 Focus on concrete examples from their responses.
@@ -1332,7 +1549,6 @@ Identify and elaborate on the candidate's key strengths based on interview respo
 Provide 3-5 specific strengths with brief explanations. Each strength should reference specific examples from their responses. Format as markdown bullet points.
 </task>
 <strengths>""",
-            
             'improvements': """<system>
 You are a senior hiring manager providing constructive feedback.
 Be honest but constructive and fair.
@@ -1347,7 +1563,6 @@ Identify areas where the candidate could improve based on interview responses.
 Provide 2-4 specific areas for improvement with brief explanations. Be constructive and fair. Format as markdown bullet points.
 </task>
 <areas_for_improvement>""",
-            
             'technical': """<system>
 You are a technical hiring manager evaluating technical competency.
 Focus on demonstrated knowledge, problem-solving, and technical depth.
@@ -1363,10 +1578,12 @@ Domain: {domain}
 Key Skills: {key_skills}
 </candidate_profile>
 <task>
-Provide a detailed assessment of technical competency (2-3 paragraphs). Evaluate their understanding, problem-solving approach, and depth of knowledge. Reference specific technical responses.
+Provide a detailed assessment of technical competency (2-3 paragraphs). Evaluate their understanding, 
+problem-solving approach, and depth of knowledge. 
+Reference specific technical responses. Evvaluate strengths and weaknesses. 
+If answer is not correct as per given question then respond with that as well.
 </task>
 <technical_assessment>""",
-            
             'communication': """<system>
 You are a hiring manager evaluating communication and soft skills.
 Focus on clarity, confidence, problem-solving approach, and interpersonal skills.
@@ -1381,7 +1598,6 @@ Assess the candidate's communication and soft skills based on behavioral and int
 Provide a detailed assessment of communication and soft skills (2-3 paragraphs). Evaluate clarity, confidence, problem-solving approach, and interpersonal abilities. Reference specific responses.
 </task>
 <communication_assessment>""",
-            
             'recommendation': """<system>
 You are a senior hiring manager making a final hiring recommendation.
 Consider all aspects: technical skills, communication, experience level, and fit.
@@ -1403,7 +1619,7 @@ Provide a clear recommendation: "Strong Hire", "Consider", "Reject", or "Needs M
 </task>
 <recommendation>"""
         }
-        
+
         # Generate all sections in parallel using async
         async def generate_all_sections():
             async with aiohttp.ClientSession() as session:
@@ -1412,7 +1628,6 @@ Provide a clear recommendation: "Strong Hire", "Consider", "Reject", or "Needs M
                     for name, prompt in section_prompts.items()
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                
                 # Process results
                 sections = {}
                 for result in results:
@@ -1422,9 +1637,8 @@ Provide a clear recommendation: "Strong Hire", "Consider", "Reject", or "Needs M
                     section_name, content = result
                     if content:
                         sections[section_name] = content
-                
                 return sections
-        
+
         try:
             sections = asyncio.run(generate_all_sections())
         except RuntimeError:
@@ -1432,29 +1646,22 @@ Provide a clear recommendation: "Strong Hire", "Consider", "Reject", or "Needs M
             asyncio.set_event_loop(loop)
             sections = loop.run_until_complete(generate_all_sections())
             loop.close()
-        
+
         # Combine sections into final analysis
         if sections:
-            analysis = f"# Post-Interview Analysis for {profile.get('name', 'Unknown')}\n\n"
-            
+            analysis = f"# Post-Interview Analysis for {profile.get('name', 'Unknown')}\n"
             if 'overall' in sections:
-                analysis += f"## Overall Impression\n\n{sections['overall']}\n\n"
-            
+                analysis += f"## Overall Impression\n{sections['overall']}\n"
             if 'strengths' in sections:
-                analysis += f"## Strengths\n\n{sections['strengths']}\n\n"
-            
+                analysis += f"## Strengths\n{sections['strengths']}\n"
             if 'improvements' in sections:
-                analysis += f"## Areas for Improvement\n\n{sections['improvements']}\n\n"
-            
+                analysis += f"## Areas for Improvement\n{sections['improvements']}\n"
             if 'technical' in sections:
-                analysis += f"## Technical Competency\n\n{sections['technical']}\n\n"
-            
+                analysis += f"## Technical Competency\n{sections['technical']}\n"
             if 'communication' in sections:
-                analysis += f"## Communication & Soft Skills\n\n{sections['communication']}\n\n"
-            
+                analysis += f"## Communication & Soft Skills\n{sections['communication']}\n"
             if 'recommendation' in sections:
-                analysis += f"## Final Recommendation\n\n{sections['recommendation']}\n\n"
-            
+                analysis += f"## Final Recommendation\n{sections['recommendation']}\n"
             logger.log_event("success", "Post-interview analysis generated successfully with all sections")
             return analysis.strip()
         else:
@@ -1477,14 +1684,13 @@ Provide a brief overall assessment and recommendation (2-3 paragraphs).
 <assessment>"""
             fallback_result = call_lm_studio_model(fallback_prompt, max_tokens=1000, temperature=0.6)
             if fallback_result:
-                return f"# Post-Interview Analysis for {profile.get('name', 'Unknown')}\n\n## Overall Assessment\n\n{fallback_result.strip()}\n"
-            return "# Post-Interview Analysis\n\nAnalysis generation encountered an error. Please review the interview responses manually."
-            
+                return f"# Post-Interview Analysis for {profile.get('name', 'Unknown')}\n## Overall Assessment\n{fallback_result.strip()}\n"
+            return "# Post-Interview Analysis\nAnalysis generation encountered an error. Please review the interview responses manually."
     except Exception as e:
         logger.log_event("error", f"Post-interview analysis generation failed: {str(e)}")
         import traceback
         logger.log_event("error", f"Traceback: {traceback.format_exc()}")
-        return f"# Post-Interview Analysis\n\nAn error occurred while generating the analysis: {str(e)}"
+        return f"# Post-Interview Analysis\nAn error occurred while generating the analysis: {str(e)}"
 
 # ==================== PDF REPORT GENERATOR ====================
 def sanitize_text_for_pdf(text):
@@ -1493,21 +1699,22 @@ def sanitize_text_for_pdf(text):
         return ""
     # Replace common Unicode characters with ASCII equivalents
     replacements = {
-        '\u2014': '--',  
-        '\u2013': '-',   
-        '\u2018': "'",   
-        '\u2019': "'",   
-        '\u201C': '"',   
-        '\u201D': '"',   
-        '\u2026': '...', 
-        '\u00A0': ' ',   
-        '\u2022': '*',   
-        '\u00AE': '(R)', 
-        '\u00A9': '(C)', 
+        '\u2014': '--',
+        '\u2013': '-',
+        '\u2018': "'",
+        '\u2019': "'",
+        '\u201C': '"',
+        '\u201D': '"',
+        '\u2026': '...',
+        '\u00A0': ' ',
+        '\u2022': '*',
+        '\u00AE': '(R)',
+        '\u00A9': '(C)',
     }
     result = text
     for unicode_char, ascii_char in replacements.items():
         result = result.replace(unicode_char, ascii_char)
+
     try:
         result.encode('latin-1')
     except UnicodeEncodeError:
@@ -1545,6 +1752,7 @@ def generate_pdf_report(session_data, filename, analysis_text, logger):
         logger.log_event("info", f"Generating PDF report: {filename}")
         pdf = PDFReport()
         pdf.add_page()
+
         # Candidate Information
         pdf.chapter_title("Candidate Information")
         profile = session_data.get("profile", {})
@@ -1555,6 +1763,7 @@ def generate_pdf_report(session_data, filename, analysis_text, logger):
             f"Total Experience: {profile.get('total_experience_years', 'N/A')} years",
             f"Interview Date: {session_data.get('start_time', datetime.now().isoformat())}"
         ])
+
         # Skills & Experience
         pdf.chapter_title("Skills & Experience")
         pdf.chapter_body([
@@ -1563,6 +1772,7 @@ def generate_pdf_report(session_data, filename, analysis_text, logger):
             f"Work Experience: {len(profile.get('work_experience', []))} entries",
             f"Education: {', '.join(profile.get('education', [])[:2])}"
         ])
+
         # Interview Responses
         pdf.chapter_title("Interview Responses")
         responses = session_data.get("responses", [])
@@ -1572,6 +1782,10 @@ def generate_pdf_report(session_data, filename, analysis_text, logger):
             pdf.set_font('Arial', '', 10)
             pdf.multi_cell(0, 6, sanitize_text_for_pdf(f"Question: {resp.get('question', 'N/A')}"))
             pdf.multi_cell(0, 6, sanitize_text_for_pdf(f"Response: {resp.get('response', 'N/A')}"))
+            # Add RES score if available
+            res_score = resp.get('res_score')
+            if res_score is not None:
+                pdf.multi_cell(0, 6, sanitize_text_for_pdf(f"RES Score: {res_score:.2f}"))
             pdf.ln(4)
 
         pdf.chapter_title("AI Generated Post-Interview Analysis")
@@ -1612,7 +1826,7 @@ def show_welcome():
     ║                                                              ║
     ║                         TRES-AI                              ║
     ║                                                              ║
-    ║            Powered by LM Studio & Advanced NLP               ║
+    ║             Powered by LLMs & Advanced NLP                   ║
     ║                                                              ║
     ╚══════════════════════════════════════════════════════════════╝
     """, style="bold blue")
@@ -1645,8 +1859,8 @@ def show_interview_question(question):
     logging.info(f"Question displayed: {question[:50]}...")
 
 def show_interview_progress(current, section):
-    progress_text = f"[dim][cyan]Section:[/cyan] {section}[/dim]"
-    console.print(progress_text)
+    # progress_text = f"[dim][cyan]Section:[/cyan] {section}[/dim]"
+    # console.print(progress_text)
     logging.info(f"Progress: Question {current} in section {section}")
 
 def show_interview_complete():
@@ -1663,29 +1877,28 @@ are being generated.""",
 def show_extracted_entities(entities, domain, experience_level):
     """Display extracted entities from resume analysis"""
     console.print("\n[bold cyan]📋 Extracted Resume Information:[/bold cyan]\n")
-    
     # Create a table for better formatting
     info_table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     info_table.add_column("Category", style="cyan", width=20)
     info_table.add_column("Details", style="yellow", width=60)
-    
+
     # Name
     name = entities.get("name", "Not identified")
     info_table.add_row("👤 Name", name or "Not identified")
-    
+
     # Domain and Experience
     info_table.add_row("🎯 Domain", domain)
     info_table.add_row("📊 Experience Level", experience_level)
     exp_years = entities.get("total_experience_years", 0)
     info_table.add_row("⏱️  Total Years", f"{exp_years} years" if exp_years > 0 else "Not specified")
-    
+
     # Skills
     skills = entities.get("skills", [])
     skills_display = ', '.join(skills[:MAX_SKILLS_DISPLAY]) if skills else "None identified"
     if len(skills) > MAX_SKILLS_DISPLAY:
         skills_display += f" (+{len(skills) - MAX_SKILLS_DISPLAY} more)"
     info_table.add_row("🛠️  Skills", skills_display)
-    
+
     # Projects
     projects = entities.get("projects", [])
     if projects:
@@ -1695,7 +1908,7 @@ def show_extracted_entities(entities, domain, experience_level):
     else:
         projects_display = "None identified"
     info_table.add_row("💼 Projects", projects_display)
-    
+
     # Work Experience
     work_exp = entities.get("work_experience", [])
     if work_exp:
@@ -1705,17 +1918,17 @@ def show_extracted_entities(entities, domain, experience_level):
     else:
         work_display = "None identified"
     info_table.add_row("🏢 Work Experience", work_display)
-    
+
     # Education
     education = entities.get("education", [])
     edu_display = '\n'.join([f"  • {edu}" for edu in education[:3]]) if education else "None identified"
     info_table.add_row("🎓 Education", edu_display)
-    
+
     # Responsibilities
     responsibilities = entities.get("responsibilities", [])
     resp_display = '\n'.join([f"  • {resp}" for resp in responsibilities[:3]]) if responsibilities else "None identified"
     info_table.add_row("⭐ Responsibilities", resp_display)
-    
+
     console.print(info_table)
     console.print("")
     logging.info("Extracted entities displayed to user")
@@ -1735,7 +1948,7 @@ def run_interview(pdf_path):
     else:
         console.print("[bold yellow]No name provided, will use extracted name from resume if available.[/bold yellow]\n")
         logging.info("User did not provide name")
-    
+
     console.print("[bold blue]📡 Connecting to LM Studio...[/bold blue]")
     logging.info("Testing LM Studio connection")
     test_prompt = "Hello, this is a connection test."
@@ -1781,29 +1994,30 @@ def run_interview(pdf_path):
     console.print("[bold blue]🎯 Identifying your technical domain...[/bold blue]")
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
         progress.add_task(description="Determining best-fit technical area...", total=None)
+        # Pass the full resume text to the improved classifier
         domain = classify_domain_with_lm_studio(resume_text, md_logger)
         time.sleep(1)
 
     profile = create_profile(entities, domain, md_logger)
-    
     if user_name:
         profile["name"] = user_name
-        entities["name"] = user_name 
+        entities["name"] = user_name
         md_logger.log_event("info", f"Using user-provided name in profile: {user_name}")
     else:
         md_logger.log_event("info", f"Using extracted name in profile: {profile.get('name', 'Unknown')}")
-    
+
     show_extracted_entities(entities, domain, experience_level)
-    
+
     # Ask user to confirm or continue
     console.print("[bold yellow]Press Enter to start the interview...[/bold yellow]")
     input()
+
     # Don't clear console - keep resume info visible
     console.print("\n")  # Just add a newline for separation
-    
+
     session_manager = SessionManager(md_logger)
     session_id = session_manager.create_session(profile["name"], domain, experience_level, profile)
-    
+
     # Store resume items for tracking in resume-driven questions
     session_manager.sessions[session_id]["asked_resume_items"] = {
         "projects": set(),
@@ -1813,6 +2027,7 @@ def run_interview(pdf_path):
     # Removed session ID print
     # console.print(f"[bold green]✓ Interview session started! Session ID: {session_id}[/bold green]")
     console.print(f"[bold green]✓ Interview session started![/bold green]")
+
     md_logger.session_data["session_id"] = session_id
     md_logger.session_data["domain"] = domain
     md_logger.session_data["experience_level"] = experience_level
@@ -1825,87 +2040,90 @@ def run_interview(pdf_path):
 
     question_counter = 0
     current_section_index = 0
-    
+
     # Dynamic interview flow with follow-ups
     for section_index, section_info in enumerate(INTERVIEW_FLOW):
         section_name = section_info["name"]
         num_questions = section_info["question_count"]
-        
+
         # Show section header when entering a new section
         if section_index > 0:
             # Natural transition between sections
             console.print(f"\n[dim]────────────────────────────────────────────[/dim]\n")
             time.sleep(0.8)
-        
         show_interview_section_header(section_name, section_info["description"])
         time.sleep(0.8)
-        
+
         # Reset question counter for this section
         session_manager.sessions[session_id]["interview_progress"]["current_question_in_section"] = 0
-        
+
         # Ask questions in this section
         for q_in_section in range(num_questions):
             session_manager.sessions[session_id]["interview_progress"]["current_question_in_section"] = q_in_section
-            
+
             # Generate question dynamically
             with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
                 progress.add_task(description="[dim]Thinking...[/dim]", total=None)
                 question = generate_dynamic_question(
-                    section_info, domain, experience_level, profile, 
+                    section_info, domain, experience_level, profile,
                     session_manager, session_id, md_logger
                 )
-            
+
             question_counter += 1
             show_interview_question(question)
+
             response = Prompt.ask("[bold cyan]Your Response[/bold cyan]")
-            
             if not response or not response.strip():
                 response = "[No response provided]"
-            
-            # Store response
+
+            # --- NEW: Calculate RES Score ---
+            res_score = score_explainability_res(response, md_logger)
+            # --- END NEW ---
+
+            # Store response (add res_score)
             if session_manager.add_response(session_id, question, response, section_name):
-                md_logger.log_response(question, response, section_name)
-            
+                # Pass res_score to log_response
+                md_logger.log_response(question, response, section_name, res_score=res_score) # Pass the score here
+
             # Evaluate response for follow-up or evaluation
             needs_followup = False
             if len(response.strip()) > 10:  # Only evaluate non-empty responses
                 # Check if response needs follow-up (except for closing/candidate questions)
                 if section_name not in ["Closing", "Candidate's Questions"]:
                     needs_followup = evaluate_response_for_followup(question, response, md_logger)
-            
+
             # Ask follow-up if needed (once per question)
             if needs_followup and q_in_section < num_questions - 1:  # Don't follow-up on last question in section
                 console.print("[dim]Let me ask a quick follow-up...[/dim]\n")
                 time.sleep(0.3)
-                
                 followup_question = generate_followup_question(question, response, domain, md_logger)
                 show_interview_question(followup_question)
                 followup_response = Prompt.ask("[bold cyan]Your Response[/bold cyan]")
-                
                 if followup_response and followup_response.strip():
                     session_manager.add_response(session_id, followup_question, followup_response, section_name)
-                    md_logger.log_response(followup_question, followup_response, section_name)
-                    
+                    # Also log followup with RES score if needed, though it might not be the main focus
+                    followup_res_score = score_explainability_res(followup_response, md_logger)
+                    md_logger.log_response(followup_question, followup_response, section_name, res_score=followup_res_score)
                     # Update main response with follow-up context
                     session_manager.sessions[session_id]["responses"][-2]["has_followup"] = True
                     session_manager.sessions[session_id]["responses"][-2]["followup"] = {
                         "question": followup_question,
                         "response": followup_response
                     }
-            
+
             # Evaluate performance for technical sections
             if section_name in ["Technical Deep-Dive", "Applied Problem-Solving"]:
                 performance_indicator = evaluate_response_simple(question, response, section_name, md_logger)
                 question_type = "definition" if session_manager.sessions[session_id]["interview_progress"]["technical_difficulty"] == "EASY" else "application"
                 session_manager.update_difficulty_and_context(session_id, performance_indicator, section_name, question_type)
                 md_logger.log_event("info", f"Performance indicator: {performance_indicator}, Difficulty: {session_manager.sessions[session_id]['interview_progress']['technical_difficulty']}")
-            
+
             # Natural acknowledgment (sometimes)
             if section_name in ["Resume-Driven Questions", "Behavioral & Soft Skills"] and not needs_followup:
                 # Occasionally acknowledge good responses
                 if question_counter % 3 == 0:  # Every 3rd question
                     console.print("[dim]Thanks for sharing that.[/dim]\n")
-            
+
             console.print("")
             time.sleep(0.5)
 
@@ -1920,6 +2138,7 @@ def run_interview(pdf_path):
 
         # Generate LLM Analysis
         analysis_text = generate_post_interview_analysis(session_data, profile, md_logger)
+
         # Save analysis to a markdown file
         analysis_filename = f"{base_dir}/analysis/post_interview_analysis_{session_id}.md"
         try:
@@ -1928,7 +2147,6 @@ def run_interview(pdf_path):
             md_logger.log_event("success", f"LLM Analysis saved to {analysis_filename}")
         except Exception as e:
             md_logger.log_event("error", f"Failed to save LLM Analysis: {str(e)}")
-
 
         # Generate PDF Report (now includes analysis_text)
         pdf_filename = f"{base_dir}/reports/interview_report_{session_id}.pdf"
@@ -1948,6 +2166,11 @@ def run_interview(pdf_path):
                     f.write(f"### Q{i}: {resp.get('section', 'N/A')}\n")
                     f.write(f"**Question:** {resp.get('question', 'N/A')}\n")
                     f.write(f"**Response:** {resp.get('response', 'N/A')}\n")
+                    # Add RES score to markdown report
+                    res_score = resp.get('res_score')
+                    if res_score is not None:
+                        f.write(f"**RES Score:** {res_score:.2f}\n")
+
                 f.write("\n## AI Generated Post-Interview Analysis\n")
                 f.write(analysis_text) # Include the generated analysis
             md_logger.log_event("success", f"Markdown report generated: {md_filename}")
@@ -1964,6 +2187,7 @@ def run_interview(pdf_path):
     console.print(f"   • Markdown Report: {md_filename}")
     console.print(f"   • LLM Analysis: {analysis_filename}")
     console.print(f"   • Detailed Log: {base_dir}/logs/session_log.md")
+
     # Generic thank you message - Name removed
     console.print(f"\n[bold blue]Thank you for your time![/bold blue]")
     logging.info("Interview process completed successfully")
@@ -1971,7 +2195,7 @@ def run_interview(pdf_path):
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        console.print("[bold red]Usage:[/bold red] python interview_system.py <resume.pdf>")
+        console.print("[bold red]Usage:[/bold red] python interview_system_with_res.py <resume.pdf>")
         logging.error("Incorrect usage - missing PDF path")
         sys.exit(1)
 
