@@ -1,14 +1,12 @@
-
-
 # 🚀 TRES-AI: The Real-time Explainability Scoring for AI-Powered Technical Interviews
 
 > **The first AI interviewer that doesn’t just judge *what* you know — but *how well you explain it*.**
 
-TRES-AI is a **privacy-first, terminal-based AI interview system** that conducts end-to-end technical interviews by analyzing a candidate’s resume and dynamically generating, evaluating, and reporting on responses — with a **novel, quantifiable metric for communication clarity**: **Real-time Explainability Scoring (RES)**.
+TRES-AI is a **privacy-first, terminal-based AI interview system** that conducts end-to-end technical interviews by analyzing a candidate’s resume and dynamically generating, evaluating, and repo[...] 
 
-Unlike conventional AI interviewers that focus solely on technical correctness, TRES-AI measures **how clearly, logically, and coherently** a candidate articulates their knowledge — turning soft skills into **objective, actionable insights**.
+Unlike conventional AI interviewers that focus solely on technical correctness, TRES-AI measures **how clearly, logically, and coherently** a candidate articulates their knowledge — turning soft [...]
 
-Built entirely on **local LLMs (via LM Studio)** with no cloud dependency, TRES-AI is designed for **ethical, secure, and reproducible hiring evaluation** — ideal for research, education, and enterprise use.
+Built entirely on **local LLMs (via LM Studio)** with no cloud dependency, TRES-AI is designed for **ethical, secure, and reproducible hiring evaluation** — ideal for research, education, and en[...]
 
 ---
 
@@ -16,7 +14,7 @@ Built entirely on **local LLMs (via LM Studio)** with no cloud dependency, TRES-
 
 | Feature | Why It Matters |
 |--------|----------------|
-| **✅ Real-time Explainability Scoring (RES)** | **World-first** metric (1.0–3.0) that quantifies *how well* a candidate explains technical concepts — trained on a novel 2,000+ sample dataset (**TRES-Bench**). |
+| **✅ Real-time Explainability Scoring (RES)** | **World-first** metric (1.0–3.0) that quantifies *how well* a candidate explains technical concepts — trained on a novel 2,000+ sample datase[...] 
 | **🧠 Lightweight, On-Device RES Model** | A **75MB DistilBERT regression model** runs in <50ms on CPU — no API calls, no latency, no data leaving your machine. |
 | **🔁 Adaptive Interview Flow** | Questions dynamically adjust based on **performance**, **domain**, and **communication clarity** (RES score). |
 | **💬 Contrastive Self-Rationale** | After each response, the system generates human-readable feedback: *“Score: 2.8 — Good structure, lacked a concrete example.”* |
@@ -123,7 +121,7 @@ python -m spacy download en_core_web_sm
 
 ## 🧪 TRES-Bench: The First Explainability Dataset for Technical Interviews
 
-To enable research, we release **TRES-Bench** — a **balanced, human-aligned dataset** of **2,001 technical interview responses** labeled with **Real-time Explainability Scores (RES: 1.0–3.0)**.
+To enable research, we release **TRES-Bench** — a **balanced, human-aligned dataset** of **2,001 technical interview responses** labeled with **Real-time Explainability Scores (RES: 1.0–3.0)*[...] 
 
 - ✅ **1,000+ samples** generated via controlled LLM prompting
 - ✅ **Balanced distribution**: 667 samples per score (1.0, 2.0, 3.0)
@@ -147,6 +145,8 @@ TRES-AI introduces **three groundbreaking contributions**:
 
 3. **Privacy-Preserving, Reproducible Hiring**  
    Unlike cloud-based tools (e.g., HireVue), TRES-AI runs **entirely offline**, ensuring **data privacy** and **ethical compliance** — ideal for research and regulated industries.
+
+4. Extending the research scope with Oracle Express APEX Recruitement models.
 
 > This system is **publication-ready** and has been validated for **ACL, CHI, FAccT, and AIES** venues.
 
@@ -198,12 +198,12 @@ NLP-TRES-AI/
 **Question:**
 Explain overfitting and how to prevent it.
 **Response:**
-Overfitting happens when a model learns the training data too well, including noise, so it fails on new data. To prevent it, you can use cross-validation, regularization like L1/L2, or simplify the model. For example, in a tree model, you'd limit depth.
+Overfitting happens when a model learns the training data too well, including noise, so it fails on new data. To prevent it, you can use cross-validation, regularization like L1/L2, or simplify t[...]
 ```
 
 **In `interview_report.pdf`:**
 > **Communication & Soft Skills**  
-> *The candidate demonstrated strong technical knowledge (85% correct answers) with exceptional explainability (avg RES: 2.7/3.0), indicating a rare ability to communicate complex ideas clearly — a key trait for senior roles.*
+> *The candidate demonstrated strong technical knowledge (85% correct answers) with exceptional explainability (avg RES: 2.7/3.0), indicating a rare ability to communicate complex ideas clearly �[...]
 
 ---
 
